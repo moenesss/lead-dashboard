@@ -8,6 +8,7 @@ from routes.outreach import router as outreach_router
 from routes.scrapers import router as scrapers_router
 from routes.decision_makers import router as decision_makers_router
 from routes.export import router as export_router
+from routes.client_prospector import router as prospector_router
 
 # ─────────────────────────────────────────
 # App Setup
@@ -38,7 +39,7 @@ app.include_router(outreach_router)
 app.include_router(scrapers_router)
 app.include_router(decision_makers_router)
 app.include_router(export_router)
-
+app.include_router(prospector_router)
 
 # ─────────────────────────────────────────
 # Dashboard Stats Endpoint

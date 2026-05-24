@@ -1,4 +1,5 @@
 import asyncio
+import re
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,6 +26,18 @@ ZONE_KEYWORDS = {
     "La Marsa": ["la marsa", "marsa"],
     "Ariana": ["ariana"],
 }
+
+def clean_text(s: str) -> str:
+    """Strip Google Maps UI icons and collapse whitespace into a single clean line."""
+    if not s:
+        return ""
+    # Remove all Unicode private-use area characters (Google Maps icons: 📍\ue0c8, ☎\ue0b0, etc.)
+    s = re.sub(r'[\ue000-\uf8ff]', '', s)
+    # Collapse newlines and tabs into a single space
+    s = re.sub(r'[\r\n\t]+', ' ', s)
+    # Collapse multiple spaces
+    s = re.sub(r' {2,}', ' ', s)
+    return s.strip()
 
 def detect_zone(address: str) -> str:
     if not address:
@@ -83,7 +96,7 @@ async def scrape_query(page, query: str, max_results: int = 20):
             for selector in ['h1.DUwDvf', 'h1[class*="fontHeadlineLarge"]', 'h1']:
                 try:
                     el = page.locator(selector).first
-                    text = (await el.inner_text(timeout=3000)).strip()
+                    text = clean_text(await el.inner_text(timeout=3000))
                     if text:
                         result["name"] = text
                         break
@@ -93,17 +106,17 @@ async def scrape_query(page, query: str, max_results: int = 20):
             if not result.get("name"):
                 continue
 
-            # Address
+            # Address — clean_text strips icons and collapses newlines
             try:
                 el = page.locator('[data-item-id="address"]').first
-                result["address"] = (await el.inner_text(timeout=3000)).strip()
+                result["address"] = clean_text(await el.inner_text(timeout=3000))
             except:
                 result["address"] = ""
 
-            # Phone
+            # Phone — clean_text strips the phone icon character
             try:
                 el = page.locator('[data-item-id^="phone:tel"]').first
-                result["phone"] = (await el.inner_text(timeout=3000)).strip()
+                result["phone"] = clean_text(await el.inner_text(timeout=3000))
             except:
                 result["phone"] = ""
 
@@ -119,18 +132,17 @@ async def scrape_query(page, query: str, max_results: int = 20):
             # Rating
             try:
                 el = page.locator('div.F7nice span[aria-hidden="true"]').first
-                rating_text = (await el.inner_text(timeout=2000)).strip().replace(",", ".")
+                rating_text = clean_text(await el.inner_text(timeout=2000)).replace(",", ".")
                 result["google_rating"] = float(rating_text)
             except:
                 result["google_rating"] = None
 
-            result["google_maps_url"] = page.url
             result["zone"] = detect_zone(result.get("address", ""))
             result["category"] = detect_category(result.get("name", ""))
             result["source"] = "google_maps"
 
             results.append(result)
-            print(f"  ✅ {result['name']} | {result['zone']} | {result.get('phone') or '—'}")
+            print(f"  ✅ {result['name']} | {result['zone']} | {result.get('phone') or '—'} | {result.get('website') or 'no website'}")
 
         except Exception as e:
             print(f"  ⚠️ Skipped: {e}")
@@ -159,30 +171,44 @@ def save_to_db(results: list, query: str) -> dict:
             if existing:
                 conn.execute("""
                              UPDATE agencies SET
-                                                 address = COALESCE(?, address),
-                                                 zone = COALESCE(?, zone),
-                                                 website = COALESCE(?, website),
-                                                 google_maps_url = COALESCE(?, google_maps_url),
+                                                 address      = COALESCE(?, address),
+                                                 zone         = COALESCE(?, zone),
+                                                 website      = COALESCE(?, website),
                                                  google_rating = COALESCE(?, google_rating),
                                                  date_updated = datetime('now')
                              WHERE id = ?
-                             """, (r.get("address") or None, r.get("zone") or None,
-                                   r.get("website") or None, r.get("google_maps_url") or None,
-                                   r.get("google_rating"), existing["id"]))
+                             """, (
+                                 r.get("address") or None,
+                                 r.get("zone") or None,
+                                 r.get("website") or None,
+                                 r.get("google_rating"),
+                                 existing["id"]
+                             ))
+                # Also update phone in contacts if we got one
+                if r.get("phone"):
+                    conn.execute("""
+                                 UPDATE contacts SET phone = ? WHERE agency_id = ? AND (phone IS NULL OR phone = '')
+                                 """, (r["phone"], existing["id"]))
                 updated_count += 1
             else:
                 agency_id = conn.execute("""
                                          INSERT INTO agencies
-                                         (name, category, zone, address, website, google_maps_url, google_rating, status, source)
-                                         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'google_maps')
-                                         """, (r["name"], r.get("category"), r.get("zone"), r.get("address"),
-                                               r.get("website"), r.get("google_maps_url"), r.get("google_rating"))).lastrowid
+                                             (name, category, zone, address, website, google_rating, status, source)
+                                         VALUES (?, ?, ?, ?, ?, ?, 'prospect', 'google_maps')
+                                         """, (
+                                             r["name"],
+                                             r.get("category"),
+                                             r.get("zone"),
+                                             r.get("address"),
+                                             r.get("website"),
+                                             r.get("google_rating")
+                                         )).lastrowid
 
-                if r.get("phone") or r.get("website"):
-                    conn.execute("""
-                                 INSERT INTO contacts (agency_id, phone, source)
-                                 VALUES (?, ?, 'google_maps')
-                                 """, (agency_id, r.get("phone")))
+                # Always create a contacts row so enrichment can fill email/socials later
+                conn.execute("""
+                             INSERT INTO contacts (agency_id, phone, source)
+                             VALUES (?, ?, 'google_maps')
+                             """, (agency_id, r.get("phone") or None))
 
                 new_count += 1
 
@@ -233,6 +259,10 @@ async def run_all_queries(max_per_query: int = 15):
     print("\n" + "=" * 50)
     print(f"✅ Done! Total new: {total_new} | Updated: {total_updated}")
     return {"total_new": total_new, "total_updated": total_updated}
+
+
+async def run_google_maps_scraper():
+    await run_all_queries()
 
 
 if __name__ == "__main__":

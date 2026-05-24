@@ -378,3 +378,56 @@ input::placeholder { color: var(--muted); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+/* ── APPEND THIS TO THE BOTTOM OF App.css ── */
+
+/* ── INPUT ── */
+.input {
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    padding: 10px 14px;
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.2s;
+    display: block;
+}
+
+.input:focus {
+    border-color: var(--accent);
+}
+
+.input::placeholder {
+    color: var(--muted);
+}
+
+textarea.input {
+    width: 100%;
+    resize: vertical;
+}
+
+/* ── C2C page back button fix ── */
+.btn.btn-ghost {
+    background: transparent;
+    border: 1px solid var(--border2);
+    color: var(--muted);
+}
+
+.btn.btn-ghost:hover {
+    background: var(--bg3);
+    color: var(--text);
+    border-color: var(--border2);
+}
+
+/* ── Sidebar section divider label ── */
+.sidebar-section-label {
+    font-size: 9px;
+    color: var(--muted);
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    padding: 0 12px;
+    margin-bottom: 4px;
+    margin-top: 4px;
+}

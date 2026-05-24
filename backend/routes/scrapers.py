@@ -7,6 +7,7 @@ request doesn't time out on the browser side.
 """
 
 import asyncio
+import sys
 import threading
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from database.db import get_connection
@@ -19,8 +20,16 @@ router = APIRouter(prefix="/scrapers", tags=["scrapers"])
 # ─────────────────────────────────────────
 
 def run_async_in_thread(coro):
-    """Run an asyncio coroutine in a brand-new event loop inside a thread."""
-    loop = asyncio.new_event_loop()
+    """
+    Run an asyncio coroutine in a brand-new event loop inside a thread.
+    On Windows, the default ProactorEventLoop doesn't support subprocess
+    from a thread — so we force SelectorEventLoop which Playwright needs.
+    """
+    if sys.platform == "win32":
+        loop = asyncio.SelectorEventLoop()  # ← the Windows fix
+    else:
+        loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(coro)
     finally:
@@ -44,6 +53,34 @@ def get_scraper_status():
                         """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────
+# POST /scrapers/run/googlemaps
+# ─────────────────────────────────────────
+
+@router.post("/run/googlemaps")
+async def run_googlemaps(background_tasks: BackgroundTasks):
+    try:
+        from scrapers.google_maps import run_google_maps_scraper
+        background_tasks.add_task(run_async_in_thread, run_google_maps_scraper())
+        return {"status": "started", "scraper": "googlemaps", "new": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────
+# POST /scrapers/run/enrichment
+# ─────────────────────────────────────────
+
+@router.post("/run/enrichment")
+async def run_enrichment(background_tasks: BackgroundTasks):
+    try:
+        from scrapers.website_enrichment import run_enrichment
+        background_tasks.add_task(run_async_in_thread, run_enrichment())
+        return {"status": "started", "scraper": "enrichment", "new": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────────────────
@@ -118,35 +155,7 @@ async def run_facebook(background_tasks: BackgroundTasks):
 
 
 # ─────────────────────────────────────────
-# POST /scrapers/run/googlemaps
-# ─────────────────────────────────────────
-
-@router.post("/run/googlemaps")
-async def run_googlemaps(background_tasks: BackgroundTasks):
-    try:
-        from scrapers.google_maps import run_google_maps_scraper
-        background_tasks.add_task(run_async_in_thread, run_google_maps_scraper())
-        return {"status": "started", "scraper": "googlemaps", "new": 0}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────
-# POST /scrapers/run/enrichment
-# ─────────────────────────────────────────
-
-@router.post("/run/enrichment")
-async def run_enrichment(background_tasks: BackgroundTasks):
-    try:
-        from scrapers.website_enrichment import run_enrichment
-        background_tasks.add_task(run_async_in_thread, run_enrichment())
-        return {"status": "started", "scraper": "enrichment", "new": 0}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────
-# POST /scrapers/run/keejob  (placeholder — file built next)
+# POST /scrapers/run/keejob
 # ─────────────────────────────────────────
 
 @router.post("/run/keejob")
