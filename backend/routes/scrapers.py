@@ -1,50 +1,69 @@
 """
 routes/scrapers.py
 ------------------
-Exposes POST endpoints to trigger each scraper from the frontend.
-Each endpoint runs the scraper in a background thread so the HTTP
-request doesn't time out on the browser side.
+Scraper endpoints for the Agencies page.
+
+ROOT CAUSE FIX:
+  The old code used FastAPI BackgroundTasks + SelectorEventLoop.
+  On Windows, Playwright needs ProactorEventLoop to spawn Chromium
+  subprocesses — SelectorEventLoop silently fails and returns 0 results.
+
+SOLUTION:
+  Every scraper now runs in a ThreadPoolExecutor thread with its own
+  ProactorEventLoop (Windows) or new_event_loop (Linux/Mac) and BLOCKS
+  until the scraper finishes before returning the result to the frontend.
+  The frontend already uses a 2-hour timeout so this is fine.
 """
 
 import asyncio
 import sys
-import threading
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import APIRouter, HTTPException
 from database.db import get_connection
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
 
 
 # ─────────────────────────────────────────
-# Helper: run an async scraper in a thread
+# Core helper — runs a coroutine in its own
+# event loop inside a worker thread and
+# RETURNS the result (no fire-and-forget).
 # ─────────────────────────────────────────
 
-def run_async_in_thread(coro):
+def run_in_thread(coro):
     """
-    Run an asyncio coroutine in a brand-new event loop inside a thread.
-    On Windows, the default ProactorEventLoop doesn't support subprocess
-    from a thread — so we force SelectorEventLoop which Playwright needs.
+    Execute an async coroutine in a dedicated thread with the correct
+    event loop for the platform, and return whatever the coroutine returns.
+
+    Windows  → ProactorEventLoop  (required for Playwright subprocess)
+    Linux/Mac→ new_event_loop
     """
-    if sys.platform == "win32":
-        loop = asyncio.SelectorEventLoop()  # ← the Windows fix
-    else:
-        loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    def _run():
+        if sys.platform == "win32":
+            loop = asyncio.ProactorEventLoop()
+        else:
+            loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(_run)
+        return future.result(timeout=7200)   # 2-hour hard cap
 
 
 # ─────────────────────────────────────────
-# GET /scrapers/status — last run info
+# GET /scrapers/status
 # ─────────────────────────────────────────
 
 @router.get("/status")
 def get_scraper_status():
     conn = get_connection()
     rows = conn.execute("""
-                        SELECT scraper_name, status, started_at, finished_at, records_found, records_new, notes
+                        SELECT scraper_name, status, started_at, finished_at,
+                               records_found, records_new, notes
                         FROM scraper_logs
                         WHERE id IN (
                             SELECT MAX(id) FROM scraper_logs GROUP BY scraper_name
@@ -60,11 +79,16 @@ def get_scraper_status():
 # ─────────────────────────────────────────
 
 @router.post("/run/googlemaps")
-async def run_googlemaps(background_tasks: BackgroundTasks):
+def run_googlemaps():
+    """
+    Run the Google Maps agency scraper.
+    Blocks until complete and returns the actual record counts.
+    """
     try:
-        from scrapers.google_maps import run_google_maps_scraper
-        background_tasks.add_task(run_async_in_thread, run_google_maps_scraper())
-        return {"status": "started", "scraper": "googlemaps", "new": 0}
+        from scrapers.google_maps import run_all_queries
+        result = run_in_thread(run_all_queries(max_per_query=20))
+        new = result.get("total_new", 0) if result else 0
+        return {"status": "done", "scraper": "googlemaps", "new": new}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -74,11 +98,43 @@ async def run_googlemaps(background_tasks: BackgroundTasks):
 # ─────────────────────────────────────────
 
 @router.post("/run/enrichment")
-async def run_enrichment(background_tasks: BackgroundTasks):
+def run_enrichment():
+    """
+    Visit each agency website and extract email + social links.
+    Blocks until complete.
+    """
     try:
-        from scrapers.website_enrichment import run_enrichment
-        background_tasks.add_task(run_async_in_thread, run_enrichment())
-        return {"status": "started", "scraper": "enrichment", "new": 0}
+        from scrapers.website_enrichment import run_enrichment as _enrich
+        result = run_in_thread(_enrich())
+        return {"status": "done", "scraper": "enrichment", "new": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────
+# POST /scrapers/run/linkedin
+# ─────────────────────────────────────────
+
+@router.post("/run/linkedin")
+def run_linkedin():
+    try:
+        from scrapers.linkedin_scraper import run_linkedin_scraper
+        run_in_thread(run_linkedin_scraper())
+        return {"status": "done", "scraper": "linkedin", "new": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────
+# POST /scrapers/run/facebook
+# ─────────────────────────────────────────
+
+@router.post("/run/facebook")
+def run_facebook():
+    try:
+        from scrapers.facebook_scraper import run_facebook_scraper
+        run_in_thread(run_facebook_scraper())
+        return {"status": "done", "scraper": "facebook", "new": 0}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -88,11 +144,11 @@ async def run_enrichment(background_tasks: BackgroundTasks):
 # ─────────────────────────────────────────
 
 @router.post("/run/freelances")
-async def run_freelances(background_tasks: BackgroundTasks):
+def run_freelances():
     try:
-        from scrapers.opportunities import run_all as _run
-        background_tasks.add_task(run_async_in_thread, _run())
-        return {"status": "started", "scraper": "freelances.tn", "new": 0}
+        from scrapers.opportunities import run_all
+        run_in_thread(run_all())
+        return {"status": "done", "scraper": "freelances.tn", "new": 0}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -102,7 +158,7 @@ async def run_freelances(background_tasks: BackgroundTasks):
 # ─────────────────────────────────────────
 
 @router.post("/run/tanitjobs")
-async def run_tanitjobs(background_tasks: BackgroundTasks):
+def run_tanitjobs():
     try:
         from scrapers.opportunities import scrape_tanitjobs, save_opportunities
         from playwright.async_api import async_playwright
@@ -120,36 +176,8 @@ async def run_tanitjobs(background_tasks: BackgroundTasks):
                 save_opportunities(results, "tanitjobs")
                 await browser.close()
 
-        background_tasks.add_task(run_async_in_thread, _run())
-        return {"status": "started", "scraper": "tanitjobs", "new": 0}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────
-# POST /scrapers/run/linkedin
-# ─────────────────────────────────────────
-
-@router.post("/run/linkedin")
-async def run_linkedin(background_tasks: BackgroundTasks):
-    try:
-        from scrapers.linkedin_scraper import run_linkedin_scraper
-        background_tasks.add_task(run_async_in_thread, run_linkedin_scraper())
-        return {"status": "started", "scraper": "linkedin", "new": 0}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────
-# POST /scrapers/run/facebook
-# ─────────────────────────────────────────
-
-@router.post("/run/facebook")
-async def run_facebook(background_tasks: BackgroundTasks):
-    try:
-        from scrapers.facebook_scraper import run_facebook_scraper
-        background_tasks.add_task(run_async_in_thread, run_facebook_scraper())
-        return {"status": "started", "scraper": "facebook", "new": 0}
+        run_in_thread(_run())
+        return {"status": "done", "scraper": "tanitjobs", "new": 0}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -159,10 +187,10 @@ async def run_facebook(background_tasks: BackgroundTasks):
 # ─────────────────────────────────────────
 
 @router.post("/run/keejob")
-async def run_keejob(background_tasks: BackgroundTasks):
+def run_keejob():
     try:
         from scrapers.keejob_scraper import run_keejob_scraper
-        background_tasks.add_task(run_async_in_thread, run_keejob_scraper())
-        return {"status": "started", "scraper": "keejob", "new": 0}
+        run_in_thread(run_keejob_scraper())
+        return {"status": "done", "scraper": "keejob", "new": 0}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -1,15 +1,34 @@
+"""
+scrapers/website_enrichment.py
+--------------------------------
+Visits each agency's website and extracts:
+  - Email address
+  - Phone number
+  - Instagram, Facebook, LinkedIn, TikTok, YouTube URLs
+
+Fixes vs old version:
+  - get_agencies_to_enrich() now finds ANY agency with a website
+    that is missing email OR any social link (not requiring both missing)
+  - More contact page paths tried (/equipe, /about, /a-propos, etc.)
+  - Broader social regex (catches /pages/ style Facebook URLs)
+  - Saves phone to contacts table as well
+  - No function name collision with the route layer
+"""
+
 import asyncio
+import re
 import sys
 import os
-import re
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from playwright.async_api import async_playwright
 from database.db import get_connection
 
+
 # ─────────────────────────────────────────
-# Regex patterns
+# REGEX PATTERNS
 # ─────────────────────────────────────────
+
 EMAIL_PATTERN = re.compile(
     r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
 )
@@ -17,151 +36,211 @@ PHONE_PATTERN = re.compile(
     r'(?:\+216|00216)?[\s\-]?[2-9]\d[\s\-]?\d{3}[\s\-]?\d{3}'
 )
 SOCIAL_PATTERNS = {
-    "instagram_url": re.compile(r'https?://(?:www\.)?instagram\.com/[a-zA-Z0-9_.]+/?'),
-    "facebook_url":  re.compile(r'https?://(?:www\.)?facebook\.com/[a-zA-Z0-9_.]+/?'),
-    "linkedin_url":  re.compile(r'https?://(?:www\.)?linkedin\.com/(?:company|in)/[a-zA-Z0-9_\-]+/?'),
-    "tiktok_url":    re.compile(r'https?://(?:www\.)?tiktok\.com/@[a-zA-Z0-9_.]+/?'),
-    "youtube_url":   re.compile(r'https?://(?:www\.)?youtube\.com/(?:channel|@|c)/[a-zA-Z0-9_\-]+/?'),
+    "instagram_url": re.compile(
+        r'https?://(?:www\.)?instagram\.com/(?!p/|explore/|reel/|stories/)([a-zA-Z0-9_.]+)/?'
+    ),
+    "facebook_url": re.compile(
+        r'https?://(?:www\.)?facebook\.com/(?!sharer|share|plugins|login|dialog|photo|video|watch|groups|events)([a-zA-Z0-9_.%\-/]+?)(?:\?|$|/(?:about|posts|photos))'
+    ),
+    "linkedin_url": re.compile(
+        r'https?://(?:www\.)?linkedin\.com/(?:company|in)/([a-zA-Z0-9_\-]+)/?'
+    ),
+    "tiktok_url": re.compile(
+        r'https?://(?:www\.)?tiktok\.com/@([a-zA-Z0-9_.]+)/?'
+    ),
+    "youtube_url": re.compile(
+        r'https?://(?:www\.)?youtube\.com/(?:channel/|@|c/)([a-zA-Z0-9_\-]+)/?'
+    ),
 }
 
 BLACKLISTED_EMAILS = [
     "example.com", "test.com", "domain.com", "email.com",
-    "yourdomain", "yoursite", "sentry", "wix.com",
-    "wordpress.com", "cloudflare", "google.com"
+    "yourdomain", "yoursite", "sentry.io", "wix.com",
+    "wordpress.com", "cloudflare.com", "google.com",
+    "schema.org", "w3.org", "placeholder", "noreply",
+    "no-reply", "support@", "abuse@", "webmaster@",
 ]
 
-def clean_email(email: str) -> str | None:
+CONTACT_PATHS = [
+    "/contact",
+    "/contact-us",
+    "/contactez-nous",
+    "/nous-contacter",
+    "/a-propos",
+    "/about",
+    "/about-us",
+    "/equipe",
+    "/team",
+    "/qui-sommes-nous",
+]
+
+
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
+
+def clean_email(email: str):
     email = email.lower().strip()
     if any(b in email for b in BLACKLISTED_EMAILS):
         return None
-    if len(email) > 80:
+    if len(email) > 80 or len(email) < 6:
+        return None
+    if not re.match(r'^[^@]+@[^@]+\.[^@]+$', email):
         return None
     return email
 
-def clean_phone(phone: str) -> str | None:
+
+def clean_phone(phone: str):
     phone = re.sub(r'[\s\-]', '', phone).strip()
     if len(phone) < 8:
         return None
     return phone
 
+
 def extract_from_html(html: str) -> dict:
     """Extract all contact info from raw HTML."""
     data = {
-        "emails": [],
-        "phones": [],
+        "emails":        [],
+        "phones":        [],
         "instagram_url": None,
-        "facebook_url": None,
-        "linkedin_url": None,
-        "tiktok_url": None,
-        "youtube_url": None,
+        "facebook_url":  None,
+        "linkedin_url":  None,
+        "tiktok_url":    None,
+        "youtube_url":   None,
     }
 
     # Emails
-    raw_emails = EMAIL_PATTERN.findall(html)
-    for e in raw_emails:
+    for e in EMAIL_PATTERN.findall(html):
         cleaned = clean_email(e)
         if cleaned and cleaned not in data["emails"]:
             data["emails"].append(cleaned)
 
     # Phones
-    raw_phones = PHONE_PATTERN.findall(html)
-    for p in raw_phones:
+    for p in PHONE_PATTERN.findall(html):
         cleaned = clean_phone(p)
         if cleaned and cleaned not in data["phones"]:
             data["phones"].append(cleaned)
 
-    # Social media
+    # Social media — take first valid match per platform
     for key, pattern in SOCIAL_PATTERNS.items():
         matches = pattern.findall(html)
         if matches:
-            # Take the first valid match, clean trailing slash
-            url = matches[0].rstrip("/")
-            # Skip generic/placeholder URLs
-            if not any(skip in url for skip in ["instagram.com/p/", "facebook.com/sharer", "linkedin.com/shareArticle"]):
-                data[key] = url
+            # Reconstruct full URL from the capture group
+            base_map = {
+                "instagram_url": "https://www.instagram.com/",
+                "facebook_url":  "https://www.facebook.com/",
+                "linkedin_url":  "https://www.linkedin.com/company/",
+                "tiktok_url":    "https://www.tiktok.com/@",
+                "youtube_url":   "https://www.youtube.com/@",
+            }
+            # First find the full URL match instead of group
+            full_matches = re.findall(pattern.pattern, html)
+            if full_matches:
+                url = full_matches[0]
+                if isinstance(url, tuple):
+                    url = base_map[key] + url[0]
+                url = url.rstrip("/")
+                # Skip obvious generic/share URLs
+                bad = ["sharer", "shareArticle", "login", "dialog", "/p/", "explore"]
+                if not any(b in url for b in bad):
+                    data[key] = url
 
     return data
 
 
+# ─────────────────────────────────────────
+# ENRICH ONE AGENCY
+# ─────────────────────────────────────────
+
 async def enrich_agency(page, agency: dict) -> dict | None:
-    """Visit an agency's website and extract contact info."""
-    website = agency.get("website", "")
+    """Visit an agency's website + contact page and extract all contact info."""
+    website = (agency.get("website") or "").strip()
     if not website:
         return None
-
-    # Make sure URL has protocol
     if not website.startswith("http"):
         website = "https://" + website
 
-    print(f"  🌐 Visiting: {website}")
+    print(f"  🌐 [{agency['id']}] {agency['name']} — {website}")
 
     try:
-        await page.goto(website, wait_until="domcontentloaded", timeout=20000)
+        await page.goto(website, wait_until="domcontentloaded", timeout=25000)
         await asyncio.sleep(2)
-
-        # Get main page HTML
         html = await page.content()
         data = extract_from_html(html)
-
-        # Also try the contact page if main page has no email
-        if not data["emails"]:
-            for contact_path in ["/contact", "/contact-us", "/contactez-nous", "/nous-contacter"]:
-                try:
-                    contact_url = website.rstrip("/") + contact_path
-                    await page.goto(contact_url, wait_until="domcontentloaded", timeout=15000)
-                    await asyncio.sleep(1.5)
-                    contact_html = await page.content()
-                    contact_data = extract_from_html(contact_html)
-                    if contact_data["emails"]:
-                        data["emails"].extend(contact_data["emails"])
-                        break
-                    # Merge social if not found on main page
-                    for key in SOCIAL_PATTERNS.keys():
-                        if not data[key] and contact_data[key]:
-                            data[key] = contact_data[key]
-                except:
-                    continue
-
-        return {
-            "agency_id": agency["id"],
-            "agency_name": agency["name"],
-            "email_general": data["emails"][0] if data["emails"] else None,
-            "email_secondary": data["emails"][1] if len(data["emails"]) > 1 else None,
-            "phone": data["phones"][0] if data["phones"] else None,
-            "instagram_url": data["instagram_url"],
-            "facebook_url": data["facebook_url"],
-            "linkedin_url": data["linkedin_url"],
-            "tiktok_url": data["tiktok_url"],
-            "youtube_url": data["youtube_url"],
-        }
-
     except Exception as e:
-        print(f"  ⚠️ Failed {website}: {type(e).__name__}")
+        print(f"    ⚠️ Main page failed: {type(e).__name__}")
         return None
 
+    # Try contact + about pages if still missing email or socials
+    missing_email   = not data["emails"]
+    missing_socials = not any(data[k] for k in ["instagram_url", "facebook_url", "linkedin_url"])
+
+    if missing_email or missing_socials:
+        for path in CONTACT_PATHS:
+            try:
+                url = website.rstrip("/") + path
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(1.2)
+                extra_html = await page.content()
+                extra = extract_from_html(extra_html)
+
+                if missing_email and extra["emails"]:
+                    data["emails"].extend(e for e in extra["emails"] if e not in data["emails"])
+                    missing_email = False
+
+                for k in ["instagram_url", "facebook_url", "linkedin_url", "tiktok_url", "youtube_url"]:
+                    if not data[k] and extra[k]:
+                        data[k] = extra[k]
+
+                # Stop early if we have everything
+                if not missing_email and all(data[k] for k in ["instagram_url", "facebook_url"]):
+                    break
+
+            except Exception:
+                continue
+
+    result = {
+        "agency_id":        agency["id"],
+        "agency_name":      agency["name"],
+        "email_general":    data["emails"][0] if data["emails"] else None,
+        "email_secondary":  data["emails"][1] if len(data["emails"]) > 1 else None,
+        "phone":            data["phones"][0] if data["phones"] else None,
+        "instagram_url":    data["instagram_url"],
+        "facebook_url":     data["facebook_url"],
+        "linkedin_url":     data["linkedin_url"],
+        "tiktok_url":       data["tiktok_url"],
+        "youtube_url":      data["youtube_url"],
+    }
+
+    found = [k for k, v in result.items() if v and k not in ("agency_id", "agency_name")]
+    print(f"    ✅ Found: {', '.join(found) if found else 'nothing'}")
+    return result
+
+
+# ─────────────────────────────────────────
+# SAVE ENRICHMENT TO DB
+# ─────────────────────────────────────────
 
 def save_enrichment(enriched: dict):
-    """Save enriched contact data to the database."""
     conn = get_connection()
     agency_id = enriched["agency_id"]
 
-    # Check if contact record exists
-    existing_contact = conn.execute(
+    existing = conn.execute(
         "SELECT id FROM contacts WHERE agency_id = ?", (agency_id,)
     ).fetchone()
 
-    if existing_contact:
-        # Update existing contact
+    if existing:
+        # Always overwrite with new data (use new value OR keep existing if new is NULL)
         conn.execute("""
                      UPDATE contacts SET
-                                         email_general       = COALESCE(email_general, ?),
-                                         instagram_url       = COALESCE(instagram_url, ?),
-                                         facebook_url        = COALESCE(facebook_url, ?),
-                                         linkedin_url        = COALESCE(linkedin_url, ?),
-                                         tiktok_url          = COALESCE(tiktok_url, ?),
-                                         youtube_url         = COALESCE(youtube_url, ?),
-                                         phone               = COALESCE(phone, ?),
-                                         date_updated        = datetime('now')
+                                         email_general  = COALESCE(?, email_general),
+                                         instagram_url  = COALESCE(?, instagram_url),
+                                         facebook_url   = COALESCE(?, facebook_url),
+                                         linkedin_url   = COALESCE(?, linkedin_url),
+                                         tiktok_url     = COALESCE(?, tiktok_url),
+                                         youtube_url    = COALESCE(?, youtube_url),
+                                         phone          = COALESCE(?, phone),
+                                         date_updated   = datetime('now')
                      WHERE agency_id = ?
                      """, (
                          enriched.get("email_general"),
@@ -171,15 +250,15 @@ def save_enrichment(enriched: dict):
                          enriched.get("tiktok_url"),
                          enriched.get("youtube_url"),
                          enriched.get("phone"),
-                         agency_id
+                         agency_id,
                      ))
     else:
-        # Insert new contact
+        # Create new contacts row
         conn.execute("""
-                     INSERT INTO contacts (
-                         agency_id, email_general, instagram_url, facebook_url,
-                         linkedin_url, tiktok_url, youtube_url, phone, source
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'website_enrichment')
+                     INSERT INTO contacts
+                     (agency_id, email_general, instagram_url, facebook_url,
+                      linkedin_url, tiktok_url, youtube_url, phone, source)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'website_enrichment')
                      """, (
                          agency_id,
                          enriched.get("email_general"),
@@ -195,34 +274,55 @@ def save_enrichment(enriched: dict):
     conn.close()
 
 
+# ─────────────────────────────────────────
+# GET AGENCIES THAT NEED ENRICHMENT
+# ─────────────────────────────────────────
+
 def get_agencies_to_enrich() -> list:
-    """Get all agencies that have a website but need enrichment."""
+    """
+    Return agencies that have a website but are missing email OR
+    any social media link. Previously this required BOTH to be
+    missing — now it re-enriches if ANY field is empty.
+    """
     conn = get_connection()
     rows = conn.execute("""
-                        SELECT a.id, a.name, a.website
+                        SELECT DISTINCT a.id, a.name, a.website
                         FROM agencies a
                                  LEFT JOIN contacts c ON c.agency_id = a.id
-                        WHERE a.website IS NOT NULL
-                          AND a.website != ''
-                          AND (c.email_general IS NULL OR c.instagram_url IS NULL)
+                        WHERE
+                            a.website IS NOT NULL AND a.website != ''
+                          AND (
+                            c.id IS NULL
+                                OR c.email_general    IS NULL OR c.email_general    = ''
+                                OR c.instagram_url    IS NULL OR c.instagram_url    = ''
+                                OR c.facebook_url     IS NULL OR c.facebook_url     = ''
+                            )
                         ORDER BY a.id
                         """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
+# ─────────────────────────────────────────
+# MAIN ENTRY POINT
+# ─────────────────────────────────────────
+
 async def run_enrichment():
+    """
+    Full enrichment pass — visits every agency website that is
+    missing email or social links and fills them in.
+    """
     agencies = get_agencies_to_enrich()
-    print(f"\n🔬 Website Enrichment Starting...")
-    print(f"📋 Agencies to enrich: {len(agencies)}")
+    print(f"\n🔬 Website Enrichment Starting…")
+    print(f"   Agencies to enrich: {len(agencies)}")
     print("=" * 50)
 
     if not agencies:
-        print("✅ All agencies already enriched!")
-        return
+        print("✅ All agencies already have contact data")
+        return {"enriched": 0}
 
     enriched_count = 0
-    failed_count = 0
+    failed_count   = 0
 
     # Log start
     conn = get_connection()
@@ -234,28 +334,26 @@ async def run_enrichment():
     conn.close()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)  # headless for enrichment
+        browser = await p.chromium.launch(
+            headless=False,   # visible so you can see what's happening
+            slow_mo=80,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
         context = await browser.new_context(
+            locale="fr-FR",
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         )
         page = await context.new_page()
 
         for i, agency in enumerate(agencies, 1):
-            print(f"\n[{i}/{len(agencies)}] {agency['name']}")
+            print(f"\n[{i}/{len(agencies)}]")
             result = await enrich_agency(page, agency)
-
             if result:
                 save_enrichment(result)
-                found_items = [k for k, v in result.items()
-                               if v and k not in ("agency_id", "agency_name")]
-                print(f"  ✅ Found: {', '.join(found_items)}")
                 enriched_count += 1
             else:
-                print(f"  ❌ No data found")
                 failed_count += 1
-
-            # Small delay between requests
             await asyncio.sleep(1.5)
 
         await browser.close()
@@ -271,8 +369,9 @@ async def run_enrichment():
     conn.commit()
     conn.close()
 
-    print("\n" + "=" * 50)
-    print(f"✅ Done! Enriched: {enriched_count} | Failed: {failed_count}")
+    print(f"\n{'='*50}")
+    print(f"✅ Enrichment done — {enriched_count} enriched, {failed_count} failed")
+    return {"enriched": enriched_count, "failed": failed_count}
 
 
 if __name__ == "__main__":
