@@ -1,17 +1,16 @@
 """
 scrapers/google_maps.py
 ------------------------
-STRATEGY CHANGE: No more clicking on listing cards.
+STRATEGY: No clicking on listing cards.
 
-Old approach (broken):
-  - Open Maps search → click each card → Google detects automation → browser killed
-
-New approach:
+Flow:
   1. Open Maps search result page
-  2. Scroll and collect all /maps/place/ hrefs (no clicks at all)
+  2. Smart-scroll until no new results load (up to max_results=200)
   3. Visit each place URL directly in batches of 8
   4. Extract name, phone, address, website, rating
-  5. Fresh browser per batch — if one batch gets killed, next batch starts clean
+  5. NEW: also extract email directly from the Google Maps page (some agencies list it)
+  6. NEW: if no email on Maps page AND agency has a website → visit website to scrape email
+  7. Fresh browser per batch — if one batch gets killed, next batch starts clean
 """
 
 import asyncio
@@ -55,6 +54,46 @@ INIT_SCRIPT = """
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
     window.chrome = { runtime: {} };
 """
+
+# ─────────────────────────────────────────
+# EMAIL REGEX + BLACKLIST
+# ─────────────────────────────────────────
+
+EMAIL_PATTERN = re.compile(
+    r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+)
+BLACKLISTED_EMAILS = [
+    "example.com", "test.com", "domain.com", "email.com",
+    "yourdomain", "yoursite", "sentry.io", "wix.com",
+    "wordpress.com", "cloudflare.com", "google.com",
+    "schema.org", "w3.org", "placeholder", "noreply",
+    "no-reply", "support@", "abuse@", "webmaster@",
+]
+CONTACT_PATHS = [
+    "/contact", "/contact-us", "/contactez-nous",
+    "/nous-contacter", "/a-propos", "/about", "/about-us",
+    "/equipe", "/team", "/qui-sommes-nous",
+]
+
+
+def clean_email(email: str):
+    email = email.lower().strip()
+    if any(b in email for b in BLACKLISTED_EMAILS):
+        return None
+    if len(email) > 80 or len(email) < 6:
+        return None
+    if not re.match(r'^[^@]+@[^@]+\.[^@]+$', email):
+        return None
+    return email
+
+
+def extract_email_from_html(html: str):
+    """Return the first valid, non-blacklisted email found in HTML."""
+    for raw in EMAIL_PATTERN.findall(html):
+        cleaned = clean_email(raw)
+        if cleaned:
+            return cleaned
+    return None
 
 
 def clean_text(s):
@@ -102,10 +141,10 @@ async def make_browser(p):
 
 
 # ─────────────────────────────────────────
-# STEP 1: collect place URLs (no clicks)
+# STEP 1: collect place URLs — smart scroll
 # ─────────────────────────────────────────
 
-async def collect_place_urls(query, max_results=20):
+async def collect_place_urls(query, max_results=200):
     search_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
     urls = []
     print(f"  🔍 Collecting URLs for: {query}")
@@ -117,16 +156,42 @@ async def collect_place_urls(query, max_results=20):
             await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
             await asyncio.sleep(4)
 
-            # Scroll to load more results — no clicking
-            for _ in range(10):
+            # Smart scroll: keep scrolling until no new links appear or we hit max_results
+            previous_count = 0
+            stall_count = 0
+            max_stalls = 4          # stop if count doesn't grow for 4 consecutive scrolls
+            max_scroll_rounds = 50  # absolute safety cap (~200 results takes ~30–40 rounds)
+
+            for round_num in range(max_scroll_rounds):
+                # Scroll the feed panel
                 await page.evaluate("""
                     const feed = document.querySelector('[role="feed"]');
-                    if (feed) feed.scrollTop += 700;
-                    else window.scrollBy(0, 700);
+                    if (feed) {
+                        feed.scrollTop += 1200;
+                    } else {
+                        window.scrollBy(0, 1200);
+                    }
                 """)
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
 
-            # Extract all place hrefs using JavaScript — zero interaction
+                # Count current links
+                current_links = await page.locator('a[href*="/maps/place/"]').all()
+                current_count = len(current_links)
+
+                if current_count >= max_results:
+                    print(f"  📋 Hit max_results cap ({max_results}) after {round_num+1} scrolls")
+                    break
+
+                if current_count == previous_count:
+                    stall_count += 1
+                    if stall_count >= max_stalls:
+                        print(f"  📋 No new results after {stall_count} scrolls — stopping ({current_count} found)")
+                        break
+                else:
+                    stall_count = 0  # reset on progress
+                    previous_count = current_count
+
+            # Extract all place hrefs
             raw = await page.evaluate("""
                 () => {
                     const seen = new Set();
@@ -153,7 +218,7 @@ async def collect_place_urls(query, max_results=20):
 
 
 # ─────────────────────────────────────────
-# STEP 2: visit each place URL directly
+# STEP 2: visit each place URL + grab email
 # ─────────────────────────────────────────
 
 async def scrape_place(url, page):
@@ -203,6 +268,44 @@ async def scrape_place(url, page):
         except Exception:
             r["google_rating"] = None
 
+        # ── NEW: Email — try Google Maps page first ──
+        email = None
+        try:
+            page_html = await page.content()
+            email = extract_email_from_html(page_html)
+        except Exception:
+            pass
+
+        # ── NEW: Fallback — visit agency website if no email yet ──
+        if not email and r.get("website"):
+            try:
+                await page.goto(r["website"], wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(1.5)
+                html = await page.content()
+                email = extract_email_from_html(html)
+
+                # If still no email, try /contact and related pages
+                if not email:
+                    for path in CONTACT_PATHS:
+                        try:
+                            await page.goto(r["website"].rstrip("/") + path, wait_until="domcontentloaded", timeout=12000)
+                            await asyncio.sleep(1)
+                            contact_html = await page.content()
+                            email = extract_email_from_html(contact_html)
+                            if email:
+                                break
+                        except Exception:
+                            continue
+
+                # Navigate back to original place URL context (needed for subsequent scrapes)
+                # No need — each place URL is visited fresh in the loop
+            except Exception as e:
+                print(f"    ⚠️ Website email fallback failed for {r.get('name')}: {type(e).__name__}")
+
+        r["email"] = email
+        if email:
+            print(f"    ✉️  Email found: {email}")
+
         r["google_maps_url"] = url
         r["zone"]            = detect_zone(r.get("address", ""))
         r["category"]        = detect_category(r.get("name", ""))
@@ -215,7 +318,7 @@ async def scrape_place(url, page):
         return None
 
 
-async def scrape_one_query(query, max_results=20):
+async def scrape_one_query(query, max_results=200):
     print(f"\n📍 Query: {query}")
     place_urls = await collect_place_urls(query, max_results)
     if not place_urls:
@@ -236,7 +339,7 @@ async def scrape_one_query(query, max_results=20):
                         data = await scrape_place(url, page)
                         if data:
                             results.append(data)
-                            print(f"  ✅ {data['name']} | {data['zone']} | {data.get('phone') or '—'} | {data.get('website') or 'no website'}")
+                            print(f"  ✅ {data['name']} | {data['zone']} | {data.get('phone') or '—'} | {data.get('website') or 'no website'} | {'✉️ ' + data['email'] if data.get('email') else '—'}")
                         await asyncio.sleep(1.5)
                     except Exception as e:
                         if "closed" in str(e).lower():
@@ -288,16 +391,22 @@ def save_to_db(results, query):
                         "UPDATE contacts SET phone=? WHERE agency_id=? AND (phone IS NULL OR phone='')",
                         (r["phone"], existing["id"])
                     )
+                # Save email if found and not already stored
+                if r.get("email"):
+                    conn.execute(
+                        "UPDATE contacts SET email_general=? WHERE agency_id=? AND (email_general IS NULL OR email_general='')",
+                        (r["email"], existing["id"])
+                    )
                 updated_count += 1
             else:
                 aid = conn.execute("""
-                                   INSERT INTO agencies (name,category,zone,address,website,google_rating,google_maps_url,status,source)
-                                   VALUES (?,?,?,?,?,?,?,'prospect','google_maps')
+                                   INSERT INTO agencies (name, category, zone, address, website, google_rating, google_maps_url, status, source)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, 'prospect', 'google_maps')
                                    """, (r["name"], r.get("category"), r.get("zone"), r.get("address"),
                                          r.get("website"), r.get("google_rating"), r.get("google_maps_url"))).lastrowid
                 conn.execute(
-                    "INSERT INTO contacts (agency_id, phone, source) VALUES (?,?,'google_maps')",
-                    (aid, r.get("phone") or None)
+                    "INSERT INTO contacts (agency_id, phone, email_general, source) VALUES (?, ?, ?, 'google_maps')",
+                    (aid, r.get("phone") or None, r.get("email") or None)
                 )
                 new_count += 1
             conn.commit()
@@ -305,7 +414,7 @@ def save_to_db(results, query):
             print(f"  ⚠️ DB error for {r.get('name')}: {e}")
 
     conn.execute(
-        "UPDATE scraper_logs SET status='success',finished_at=datetime('now'),records_found=?,records_new=?,records_updated=? WHERE id=?",
+        "UPDATE scraper_logs SET status='success', finished_at=datetime('now'), records_found=?, records_new=?, records_updated=? WHERE id=?",
         (len(results), new_count, updated_count, log_id)
     )
     conn.commit()
@@ -317,7 +426,7 @@ def save_to_db(results, query):
 # MAIN
 # ─────────────────────────────────────────
 
-async def run_all_queries(max_per_query=15):
+async def run_all_queries(max_per_query=200):
     print("\n🗺️  Google Maps Scraper Starting…")
     print("=" * 50)
     total_new = total_updated = 0
