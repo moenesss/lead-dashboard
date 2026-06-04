@@ -181,12 +181,36 @@ CATEGORY_QUERIES = {
         "boutique Berges du Lac Tunis",
     ],
     "wedding": [
+        # Planning & services
         "wedding planner Tunis",
         "organisateur mariage luxe Tunis",
         "décoration mariage Tunis",
         "traiteur mariage Tunis",
         "photographe mariage Tunis",
         "wedding planner La Marsa Tunis",
+        # Wedding dresses — buying
+        "robe de mariée Tunis",
+        "boutique robe de mariée Tunis",
+        "robe de mariée luxe Tunis",
+        "robe de mariée La Marsa Tunis",
+        "robe de mariée Berges du Lac Tunis",
+        "robe de mariée Ariana Tunis",
+        "atelier robe de mariée Tunis",
+        "créateur robe de mariée Tunis",
+        "styliste mariage Tunis",
+        # Wedding dresses — renting
+        "location robe de mariée Tunis",
+        "location robe de soirée mariage Tunis",
+        "location tenue mariage Tunis",
+        # Suits & groom
+        "costume marié Tunis",
+        "location costume marié Tunis",
+        "tailleur mariage Tunis",
+        # Accessories & styling
+        "accessoires mariage Tunis",
+        "coiffure mariage Tunis",
+        "maquillage mariée Tunis",
+        "make-up artist mariage Tunis",
     ],
     "coworking": [
         "coworking Lac Tunis",
